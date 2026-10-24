@@ -400,6 +400,9 @@ struct __declspec(uuid("0190ec1a-2e19-74a6-ad41-4df0d4d8caed")) DeviceData {
   std::unordered_map<uint64_t, std::vector<size_t>> draw_detail_indexes_by_cmd_list;
   std::unordered_set<uint64_t> live_pipelines;
   std::unordered_map<uint64_t, std::unordered_map<reshade::api::format, reshade::api::resource_view>> preview_srvs;
+  // Guards preview_srvs only, so destroy_resource (fired on any game thread) does not wait on `mutex` while a
+  // snapshot capture holds it.
+  std::mutex preview_srvs_mutex;
   std::shared_mutex mutex;
   std::unordered_map<uint64_t, reshade::api::blend_desc> pipeline_blends;
 
@@ -4714,16 +4717,19 @@ bool OnCopyTextureRegion(
 void OnDestroyResource(reshade::api::device* device, reshade::api::resource resource) {
   auto* data = renodx::utils::data::Get<DeviceData>(device);
   if (data == nullptr) return;
-  const std::unique_lock lock(data->mutex);
-  auto pair = data->preview_srvs.find(resource.handle);
-  if (pair == data->preview_srvs.end()) return;
-  auto srvs = pair->second;
+  std::unordered_map<reshade::api::format, reshade::api::resource_view> srvs;
+  {
+    const std::scoped_lock lock(data->preview_srvs_mutex);
+    auto pair = data->preview_srvs.find(resource.handle);
+    if (pair == data->preview_srvs.end()) return;
+    srvs = std::move(pair->second);
+    data->preview_srvs.erase(pair);
+  }
   for (const auto& [format, srv] : srvs) {
     if (srv.handle != 0u) {
       device->destroy_resource_view(srv);
     }
   }
-  data->preview_srvs.erase(pair);
 }
 
 void OnPushDescriptors(
@@ -8542,29 +8548,27 @@ void RenderResourceViewPreview(reshade::api::device* device, DeviceData* data, r
                    || desc.type == reshade::api::resource_type::surface);
   if (!is_valid) return;
 
-  auto srvs = data->preview_srvs[resource.handle];
-
   reshade::api::resource_view srv = {0};
-  auto pair = srvs.find(format);
-  if (pair == srvs.end()) {
+  {
+    const std::scoped_lock lock(data->preview_srvs_mutex);
+    if (auto resource_pair = data->preview_srvs.find(resource.handle); resource_pair != data->preview_srvs.end()) {
+      if (auto pair = resource_pair->second.find(format); pair != resource_pair->second.end()) {
+        srv = pair->second;
+      }
+    }
+  }
+  if (srv.handle == 0u) {
     device->create_resource_view(
         resource,
         reshade::api::resource_usage::shader_resource,
         reshade::api::resource_view_desc(format),
         &srv);
-    if (srv.handle != 0) {
-      srvs[format] = srv;
-    } else {
+    if (srv.handle == 0u) {
       assert(false);
       return;
     }
-  } else {
-    if (destroyed) {
-      device->destroy_resource_view(srv);
-      srvs.erase(pair);
-      return;
-    }
-    srv = pair->second;
+    const std::scoped_lock lock(data->preview_srvs_mutex);
+    data->preview_srvs[resource.handle][format] = srv;
   }
 
   auto available_size = ImGui::GetContentRegionAvail();
