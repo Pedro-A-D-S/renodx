@@ -117,6 +117,8 @@ inline constexpr std::wstring_view DEVKIT_MCP_PIPE_PREFIX = L"renodx-devkit-mcp"
 std::atomic<reshade::api::device*> snapshot_device = nullptr;
 std::atomic<reshade::api::device*> snapshot_queued_device = nullptr;
 std::atomic<uint32_t> snapshot_submission_counter = 0u;
+// Presents a snapshot has been kept open because its window held no draw (see OnPresent).
+uint32_t snapshot_extra_presents = 0u;
 auto devkit_mcp_session = devkit_mcp_server_session::Create(DEVKIT_MCP_PIPE_PREFIX);
 std::atomic<uint32_t> devkit_primary_device_api = 0u;
 
@@ -9262,13 +9264,22 @@ void OnPresent(
       ++device_data->snapshot_rows_generation;
       device_data->snapshot_rows_valid = false;
       snapshot_submission_counter.store(0u, std::memory_order_relaxed);
+      snapshot_extra_presents = 0u;
       snapshot_device = device;
       snapshot_queued_device = nullptr;
     }
   } else if (device == active_snapshot_device) {
-    snapshot_device = nullptr;
     auto* device_data = get_data();
     std::unique_lock lock(device_data->mutex);
+    // With frame generation the generated frame is presented right after the rendered one, so the window between
+    // those two presents can hold no draw at all. Keep capturing for a few presents until it holds one.
+    static constexpr uint32_t SNAPSHOT_MAX_EXTRA_PRESENTS = 8u;
+    if (snapshot_extra_presents < SNAPSHOT_MAX_EXTRA_PRESENTS
+        && std::ranges::none_of(device_data->draw_details_list, [](const DrawDetails& draw) { return draw.draw_method != DrawDetails::DrawMethods::COPY; })) {
+      ++snapshot_extra_presents;
+      return;
+    }
+    snapshot_device = nullptr;
     std::ranges::sort(device_data->draw_details_list, [](const DrawDetails& a, const DrawDetails& b) {
       const bool a_unknown_submission = a.submission_order == 0u;
       const bool b_unknown_submission = b.submission_order == 0u;
