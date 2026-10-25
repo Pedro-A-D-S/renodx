@@ -649,11 +649,13 @@ inline void EncodePreviewPixel(
     };
   }
 
+  const auto is_volume = target.resolved_resource_desc.type == reshade::api::resource_type::texture_3d;
   if (target.resolved_resource_desc.type != reshade::api::resource_type::texture_2d
-      && target.resolved_resource_desc.type != reshade::api::resource_type::surface) {
+      && target.resolved_resource_desc.type != reshade::api::resource_type::surface
+      && !is_volume) {
     return ToolResult{
-        .text = "Only 2D texture resource views are currently supported.",
-        .structured_content = json{{"error", "Only 2D texture resource views are currently supported."}},
+        .text = "Only 2D and 3D texture resource views are currently supported.",
+        .structured_content = json{{"error", "Only 2D and 3D texture resource views are currently supported."}},
         .is_error = true,
     };
   }
@@ -684,6 +686,11 @@ inline void EncodePreviewPixel(
   const auto subresource = first_level + (first_layer * levels);
   const auto width = std::max<uint32_t>(target.resolved_resource_desc.texture.width >> first_level, 1u);
   const auto height = std::max<uint32_t>(target.resolved_resource_desc.texture.height >> first_level, 1u);
+  // A volume is read back slice by slice and written as one image with the depth slices stacked top to bottom.
+  const auto depth = is_volume
+                         ? std::max<uint32_t>(target.resolved_resource_desc.texture.depth_or_layers >> first_level, 1u)
+                         : 1u;
+  const auto image_height = height * depth;
   const auto intermediate_format = reshade::api::format_to_default_typed(target.resolved_resource_desc.texture.format, 0);
   const auto analysis_format = target.resolved_view_desc.format != reshade::api::format::unknown
                                    ? target.resolved_view_desc.format
@@ -692,9 +699,10 @@ inline void EncodePreviewPixel(
   reshade::api::resource intermediate = {0u};
   if (!device->create_resource(
           reshade::api::resource_desc(
+              (is_volume ? reshade::api::resource_type::texture_3d : reshade::api::resource_type::texture_2d),
               width,
               height,
-              1,
+              static_cast<uint16_t>(depth),
               1,
               intermediate_format,
               1,
@@ -779,17 +787,26 @@ inline void EncodePreviewPixel(
       preferred_crc32 = latest_upload->crc32;
       preferred_crc32_source = "latest_upload";
     }
+    // RGBA16F 2D resources are written straight from the mapped rows; a volume has slice padding, so it takes the float path.
+    const auto write_mapped_half_rows = analysis_format == reshade::api::format::r16g16b16a16_float && !is_volume;
     if (output_path.has_value() && output_format == OutputFormat::PNG) {
-      preview_pixels.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
+      preview_pixels.resize(static_cast<size_t>(width) * static_cast<size_t>(image_height) * 4u);
     }
     if (output_path.has_value() && output_format == OutputFormat::EXR) {
-      if (analysis_format != reshade::api::format::r16g16b16a16_float) {
-        exr_pixels.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
+      if (!write_mapped_half_rows) {
+        exr_pixels.resize(static_cast<size_t>(width) * static_cast<size_t>(image_height) * 4u);
       }
     }
+    const auto slice_pitch = (mapped_data.slice_pitch != 0u)
+                                 ? static_cast<size_t>(mapped_data.slice_pitch)
+                                 : (static_cast<size_t>(mapped_data.row_pitch) * height);
 
-    for (uint32_t y = 0; y < height && supported_format; ++y) {
-      const auto* row = static_cast<const std::uint8_t*>(mapped_data.data) + (static_cast<size_t>(mapped_data.row_pitch) * y);
+    for (uint32_t y = 0; y < image_height && supported_format; ++y) {
+      const auto slice = y / height;
+      const auto row_in_slice = y % height;
+      const auto* row = static_cast<const std::uint8_t*>(mapped_data.data)
+                        + (slice_pitch * slice)
+                        + (static_cast<size_t>(mapped_data.row_pitch) * row_in_slice);
       const auto pixel_stride = static_cast<size_t>(reshade::api::format_row_pitch(intermediate_format, 1));
       for (uint32_t x = 0; x < width; ++x) {
         float rgba[4] = {0.f, 0.f, 0.f, 1.f};
@@ -880,7 +897,7 @@ inline void EncodePreviewPixel(
         } else {
           switch (output_format) {
             case OutputFormat::PNG:
-              if (!WritePngPreview(output_path.value(), width, height, preview_pixels)) {
+              if (!WritePngPreview(output_path.value(), width, image_height, preview_pixels)) {
                 output_error = std::format(
                     "Failed to write preview PNG to '{}'.",
                     output_path->string());
@@ -890,13 +907,14 @@ inline void EncodePreviewPixel(
                     {"format", "png"},
                     {"mode", preview_mode_name},
                     {"width", width},
-                    {"height", height},
+                    {"height", image_height},
+                    {"depth", depth},
                 };
               }
               break;
             case OutputFormat::EXR:
               try {
-                if (analysis_format == reshade::api::format::r16g16b16a16_float) {
+                if (write_mapped_half_rows) {
                   if ((mapped_data.row_pitch % sizeof(std::uint16_t)) != 0u) {
                     output_error = std::format(
                         "Mapped RGBA16F readback row pitch ({}) is not aligned to 16-bit values.",
@@ -917,7 +935,7 @@ inline void EncodePreviewPixel(
                   renodx::utils::exr::WriteRgba16f(
                       output_path.value(),
                       width,
-                      height,
+                      image_height,
                       std::span<const float>(exr_pixels.data(), exr_pixels.size()));
                 }
                 output_json = json{
@@ -927,7 +945,8 @@ inline void EncodePreviewPixel(
                     {"compression", "none"},
                     {"pixelType", "rgba16f"},
                     {"width", width},
-                    {"height", height},
+                    {"height", image_height},
+                    {"depth", depth},
                 };
               } catch (const std::exception& exception) {
                 output_error = std::format(
@@ -1064,6 +1083,7 @@ inline void EncodePreviewPixel(
                   {"subresourceIndex", subresource},
                   {"width", width},
                   {"height", height},
+                  {"depth", depth},
                   {"analysisFormat", FormatFormat(context, analysis_format)},
                   {"intermediateFormat", FormatFormat(context, intermediate_format)},
                   {"channelCount", channel_count},
